@@ -4,6 +4,11 @@
 #include <efi.h>
 #include <efipciio.h>
 
+/*
+ * Verified for the EliteBook 8560p, board ID 1618, BIOS 68SCF F.67:
+ * RP04 is 00:1c.3. In the DSDT, RP4D is bit 3 at RCRB offset 0x341A;
+ * that is bit 19 of the dword at offset 0x3418.
+ */
 #define RP04_RCBA 0xFED1C000ULL
 #define RP04_REG (RP04_RCBA + 0x3418)
 #define RP4D_MASK 0x00080000U
@@ -34,6 +39,10 @@ FindPch(EFI_SYSTEM_TABLE *St, EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL **Rb)
     UINT32 Id, Class, Rcba;
 
     P = NULL;
+    /*
+     * Fail closed: only use the hard-coded RCRB address after confirming the
+     * expected Intel LPC/PCH function and that its RCBA points there.
+     */
     S = uefi_call_wrapper(
         St->BootServices->LocateProtocol, 3, &RootBridgeGuid, NULL, (VOID **)&P
         );
@@ -80,6 +89,7 @@ WriteReg(
     S = ReadReg(Rb, &Readback);
     if (EFI_ERROR(S))
         return S;
+    /* Verify only the control bit; other register bits are intentionally kept. */
     if ((Readback & RP4D_MASK) != (Value & RP4D_MASK))
         return EFI_DEVICE_ERROR;
 
@@ -101,6 +111,11 @@ Rp04LinkActive(
     UINTN Count;
 
     *Active = FALSE;
+    /*
+     * Confirm RP04 is present and advertises a capability list before walking
+     * PCI config space. These fixed offsets are the PCI status/capability
+     * pointer fields in the standard configuration header.
+     */
     S = uefi_call_wrapper(
         Rb->Pci.Read, 5, Rb, EfiPciIoWidthUint32, RP04_PCI + 0x04, 1, &Value
         );
@@ -118,6 +133,7 @@ Rp04LinkActive(
         return S;
     Capability = (UINT8)(Value & 0xFCU);
 
+    /* Capability pointers are aligned; the count also bounds malformed loops. */
     for (Count = 0; Capability >= 0x40 && Count < 48; Count++) {
         S = uefi_call_wrapper(
             Rb->Pci.Read, 5, Rb, EfiPciIoWidthUint32,
@@ -126,6 +142,10 @@ Rp04LinkActive(
         if (EFI_ERROR(S))
             return S;
         if ((Capabilities & 0xFFU) == 0x10U) {
+            /*
+             * PCI Express capability Link Status is at capability + 0x10.
+             * DLLLA is bit 13 of its 16-bit value (bit 29 in this dword read).
+             */
             S = uefi_call_wrapper(
                 Rb->Pci.Read, 5, Rb, EfiPciIoWidthUint32,
                 RP04_PCI + Capability + 0x10, 1, &LinkStatus
@@ -153,6 +173,11 @@ EnableIfOccupied(
     UINTN Attempt;
 
     Out(St, L"Checking RP04 link...\r\n");
+    /*
+     * Allow up to ten status checks, 100 ms apart (about 900 ms total).
+     * If a usable active link cannot be confirmed, restore the disabled state
+     * rather than leaving an unverified RP04 enabled.
+     */
     for (Attempt = 0; Attempt < 10; Attempt++) {
         S = Rp04LinkActive(Rb, &LinkActive);
         if (S == EFI_SUCCESS && LinkActive) {
@@ -194,6 +219,10 @@ Run(EFI_SYSTEM_TABLE *St, BOOLEAN Disable)
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *Rb;
     UINT32 Value;
 
+    /*
+     * Disable=TRUE is the simple disable utility. Disable=FALSE is the guarded
+     * enable path: clear RP4D if needed, then retain it only with an active link.
+     */
     Out(St, L"RP04 test\r\n");
     S = FindPch(St, &Rb);
     if (EFI_ERROR(S)) {
